@@ -97,15 +97,19 @@ class LLMInterface:
 
         return outputs.hidden_states
     
-    def get_activation(self, prompt, layer, token_position=-1):
+    def get_activations(self, prompt, layers, token_position=-1):
 
+        activations = {}
         hidden_states = self.get_hidden_states(prompt)
+        for layer in layers:
 
-        if layer < 0 or layer >= len(hidden_states):
-            raise ValueError(
-                f"Layer {layer} does not exist. "
-                f"Model has {len(hidden_states)} hidden-state tensors."
-            )
+            if layer < 0 or layer >= len(hidden_states):
+                raise ValueError(
+                    f"Layer {layer} does not exist. "
+                    f"Model has {len(hidden_states)} hidden-state tensors."
+                )
 
-        activation = hidden_states[layer][0, token_position, :]
-        return activation.detach().cpu()
+            activation = hidden_states[layer][0, token_position, :]
+            activations[layer] = activation.detach().cpu()
+        
+        return activations
