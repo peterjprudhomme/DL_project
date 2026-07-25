@@ -11,9 +11,9 @@ class ActivationSample:
     prompt: str
     response: str
 
-    # harmful: bool
-    # refused: bool 
+    # Ground truth / metadata
+    harmful: bool | None = None
+    refused: bool | None = None
 
-    # # key = transformer layer
-    # # value = activation vector
-    activations: dict[int, torch.Tensor]
+    # Layer -> activation vector
+    activations: dict[int, torch.Tensor] | None = None
