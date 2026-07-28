@@ -1,0 +1,15 @@
+name: dl_refusal
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch
+      - transformers
+      - accelerate
+      - pandas
+      - numpy
+      - scikit-learn
+      - tqdm
+      - boto3
