@@ -15,7 +15,7 @@ class LLMInterface:
             MODEL_NAME
         )
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
         self.model = AutoModelForCausalLM.from_pretrained(
