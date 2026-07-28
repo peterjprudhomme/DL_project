@@ -16,30 +16,19 @@ Note: HarmBench is gated on the Hub -> run `hf auth login` first.
 """
 
 import json
-import re
 from pathlib import Path
 
+import torch
 from tqdm import tqdm
 
 from data.dataset import HarmBenchDataset, AdvBenchDataset, CustomPromptDataset
 from src.llm import LLMInterface
-from src.config import MODEL_NAME
+from src.config import MODEL_NAME, LAYERS, model_slug
 from src.extractor import ActivationExtractor
 
 
 # Desired number of records per bucket (harmful-refused, harmful-not-refused, benign).
 TARGET_COUNT = 200
-
-
-def model_slug(model_name: str) -> str:
-    """Filesystem-safe identifier derived from MODEL_NAME.
-
-    Replaces path separators and any other non-safe characters with ``_`` and
-    strips leading/trailing underscores. Deterministic and idempotent.
-
-    'Qwen/Qwen2.5-1.5B-Instruct' -> 'Qwen_Qwen2.5-1.5B-Instruct'
-    """
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("_")
 
 
 def classify_refusal(response: str, extractor: ActivationExtractor) -> bool:
@@ -146,22 +135,19 @@ def process_benign(llm, extractor, target):
     return rows
 
 
-def write_metadata(slug, harmful_refused, harmful_not_refused, benign):
-    """Write the combined dataset to a per-model human-readable JSON file.
+def assign_ids(harmful_refused, harmful_not_refused, benign):
+    """Concatenate the three capped buckets and stamp fresh sequential ids.
 
-    Concatenates the three buckets (harmful-refused, harmful-not-refused,
-    benign), assigns each output record a fresh sequential integer ``id`` and
-    casts ``harmful``/``refused`` to ints (0/1). Serializes the list of dicts to
-    ``data/processed/{slug}/metadata.json`` with ``indent=2`` (human-readable)
-    and ``ensure_ascii=False`` (legible prompts/responses); JSON string escaping
-    handles commas, quotes, and newlines in prompts/responses automatically.
+    Buckets are concatenated in order (harmful-refused, harmful-not-refused,
+    benign). Each output record is assigned a fresh sequential integer ``id``
+    starting at 0, and its ``harmful``/``refused`` flags are cast to ints (0/1)
+    for JSON-integer compatibility with the downstream ProbeDataset reader.
 
-    Returns the list of record dicts that was written.
+    Returns a list of dicts with keys exactly ``id, prompt, response, harmful,
+    refused``.
     """
-    out_dir = Path("data/processed") / slug
-    out_dir.mkdir(parents=True, exist_ok=True)     # create dir if missing
     all_rows = harmful_refused + harmful_not_refused + benign
-    records = [
+    return [
         {
             "id": i,                                # fresh sequential unique id
             "prompt": row["prompt"],
@@ -171,9 +157,59 @@ def write_metadata(slug, harmful_refused, harmful_not_refused, benign):
         }
         for i, row in enumerate(all_rows)
     ]
+
+
+def write_metadata(slug, records):
+    """Serialize an already-id-stamped records list to a per-model JSON file.
+
+    Serializes ``records`` (a list of dicts already stamped with ids by
+    ``assign_ids``) to ``data/processed/{slug}/metadata.json`` with ``indent=2``
+    (human-readable) and ``ensure_ascii=False`` (legible prompts/responses);
+    JSON string escaping handles commas, quotes, and newlines in
+    prompts/responses automatically. Creates the output directory if missing.
+
+    Returns the list of record dicts that was written.
+    """
+    out_dir = Path("data/processed") / slug
+    out_dir.mkdir(parents=True, exist_ok=True)     # create dir if missing
     with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2, ensure_ascii=False)
     return records
+
+
+def write_activations(slug, activations):
+    """Save the id-keyed activations next to the metadata.
+
+    Composes the same per-model output directory as ``write_metadata``
+    (``data/processed/{slug}/``), creates it if missing, and serializes the
+    ``activations`` mapping to ``activations.pt`` via ``torch.save``. Writing to
+    the SAME directory as ``metadata.json`` keeps the two artifacts id-aligned
+    and colocated for the downstream ProbeDataset reader.
+    """
+    out_dir = Path("data/processed") / slug
+    out_dir.mkdir(parents=True, exist_ok=True)     # create dir if missing
+    torch.save(activations, out_dir / "activations.pt")
+
+
+def extract_activations(records, llm, layers=LAYERS):
+    """Extract hidden-state activations for each kept record's prompt.
+
+    Iterates the final, capped, id-stamped ``records`` list (so only records
+    actually written to the Metadata_File incur a forward pass) and calls
+    ``llm.get_activations(prompt, layers)`` once per record. Each record's
+    activation mapping is keyed by the record's ``id`` so the result aligns with
+    the metadata by id.
+
+    ``LLMInterface.get_activations`` returns a ``{layer: tensor}`` mapping with
+    each tensor already detached and moved to CPU, so no further device handling
+    is needed here.
+
+    Returns ``{id: {layer: cpu_tensor}}``.
+    """
+    activations = {}
+    for row in tqdm(records, desc="Extracting activations"):
+        activations[row["id"]] = llm.get_activations(row["prompt"], layers)
+    return activations
 
 
 def main():
@@ -208,8 +244,13 @@ def main():
         f"benign: {len(benign)} | target: {TARGET_COUNT}"
     )
 
-    write_metadata(slug, harmful_refused, harmful_not_refused, benign)
+    records = assign_ids(harmful_refused, harmful_not_refused, benign)
+    write_metadata(slug, records)
     print(f"Wrote dataset to data/processed/{slug}/metadata.json")
+
+    activations = extract_activations(records, llm, LAYERS)
+    write_activations(slug, activations)
+    print(f"Wrote activations to data/processed/{slug}/activations.pt")
 
 
 if __name__ == "__main__":

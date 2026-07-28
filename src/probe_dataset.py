@@ -4,10 +4,15 @@ import pandas as pd
 import torch
 import numpy as np
 
+from src.config import model_slug
+
 
 class ProbeDataset:
 
-    def __init__(self, data_dir="data/processed"):
+    def __init__(self, data_dir=None):
+
+        if data_dir is None:
+            data_dir = Path("data/processed") / model_slug()
 
         data_dir = Path(data_dir)
 

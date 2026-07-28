@@ -6,9 +6,11 @@ linearly decodable from its hidden states.
 
 The pipeline has two stages:
 
-1. **Extraction** (`app.py`) — run prompts through the model, record each
-   response, label it as refused / harmful, and save the hidden-state
-   activations for selected layers.
+1. **Extraction** (`data/prepare_dataset.py`) — run prompts through the model,
+   record each response, label it as refused / harmful, and save the
+   hidden-state activations for selected layers. This single command writes
+   both `metadata.json` and `activations.pt` under
+   `data/processed/{model_slug}/`.
 2. **Probing** (`run_probes.py`) — train a logistic-regression probe on those
    saved activations to predict `refused` from each layer, and report accuracy.
 
@@ -60,28 +62,30 @@ hf auth login
 All commands are run from the project root (`DL_project/`) so that the
 `src` and `data` package imports resolve.
 
-### Step 1 — Extract activations
+### Step 1 — Prepare the dataset and extract activations
 
 ```bash
-python app.py
+python -m data.prepare_dataset
 ```
 
-This will:
-- load the HarmBench prompts (200 harmful prompts by default),
-- generate a response for each with the Qwen model,
-- label `harmful` (always `True` for HarmBench) and `refused`
+This single command will:
+- assemble the harmful pool (HarmBench + AdvBench) and the benign set,
+- generate a response for each prompt with the Qwen model,
+- label `harmful` (from the record) and `refused`
   (keyword heuristic in `src/extractor.py`),
-- capture hidden-state activations for layers `[5, 10, 15, 20]`,
-- write outputs to `data/processed/`:
-  - `metadata.csv` — one row per prompt (id, prompt, response, harmful, refused)
-  - `activations.pt` — dict of `{id: {layer: tensor}}`
+- route records into three balanced buckets (harmful-refused,
+  harmful-not-refused, benign),
+- capture hidden-state activations for layers `[5, 10, 15, 20]`
+  (`LAYERS` in `src/config.py`) for every kept record,
+- write **both** outputs to `data/processed/{model_slug}/`:
+  - `metadata.json` — one record per prompt (id, prompt, response, harmful, refused)
+  - `activations.pt` — dict of `{id: {layer: tensor}}`, id-aligned with the metadata
 
 Expected console output ends with:
 
 ```
-Saved <N> samples.
-Metadata -> .../data/processed/metadata.csv
-Activations -> .../data/processed/activations.pt
+Wrote dataset to data/processed/{model_slug}/metadata.json
+Wrote activations to data/processed/{model_slug}/activations.pt
 ```
 
 ### Step 2 — Train the probes
@@ -90,8 +94,8 @@ Activations -> .../data/processed/activations.pt
 python run_probes.py
 ```
 
-This loads `data/processed/{metadata.csv, activations.pt}`, trains a linear
-probe per available layer to predict `refused`, and prints the layer number
+This loads `data/processed/{model_slug}/{metadata.json, activations.pt}`, trains
+a linear probe per available layer to predict `refused`, and prints the layer number
 with its test accuracy, followed by the `refused` / `harmful` label counts.
 
 ---
