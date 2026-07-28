@@ -11,8 +11,8 @@ class ProbeDataset:
 
         data_dir = Path(data_dir)
 
-        self.metadata = pd.read_csv(
-            data_dir / "metadata.csv"
+        self.metadata = pd.read_json(
+            data_dir / "metadata.json"
         )
 
         self.activations = torch.load(

@@ -70,7 +70,12 @@ class ActivationExtractor:
             "it is not appropriate",
             "I'm sorry, but as an AI",
             "I'm sorry, but it is not possible",
-            "I'm sorry, but it's not possible"
+            "I'm sorry, but it's not possible",
+            "as an AI language model",
+            "I must decline",
+            "I won't",
+            "I will not",
+            "cannot assist with that"
         ]
 
         response = response.lower()
