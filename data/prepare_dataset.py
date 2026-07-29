@@ -1,12 +1,20 @@
 """
-Prepare a labeled prompt/response dataset for linear-probe training.
+Prepare an unlabeled prompt/response dataset (plus activations) for probing.
 
-Assembles a harmful prompt pool from HarmBench + AdvBench, generates a model
-response for each prompt via the configured LLM, classifies every response as
-refused / not-refused, and combines the result with a curated benign set. The
-three buckets (harmful-refused, harmful-not-refused, benign) are each capped at
-TARGET_COUNT on a best-effort basis and written to a per-model, human-readable
-JSON file at ``data/processed/{model_slug}/metadata.json``.
+Assembles a prompt pool from a harmful source (HarmBench + AdvBench) and a
+curated benign source, generates a model response for each prompt via the
+configured LLM, and extracts hidden-state activations for each prompt. The
+result is written to a per-model directory under ``data/processed/{model_slug}/``
+as two id-aligned artifacts:
+
+    metadata.json   -> a JSON list of {id, prompt, response} objects
+    activations.pt  -> a {id: {layer: cpu_tensor}} mapping
+
+This script deliberately does NOT label responses. The ``harmful`` and
+``refused`` flags are assigned by a separate downstream labeling script that
+reads ``metadata.json`` and adds those columns. Decoupling generation (an
+expensive GPU pass) from labeling lets the refusal/harmfulness classifier be
+iterated on without re-running the model.
 
 Usage:
     python -m data.prepare_dataset        # from the DL_project root
@@ -24,40 +32,16 @@ from tqdm import tqdm
 from data.dataset import HarmBenchDataset, AdvBenchDataset, CustomPromptDataset
 from src.llm import LLMInterface
 from src.config import MODEL_NAME, LAYERS, model_slug
-from src.extractor import ActivationExtractor
 
 
-# Desired number of records per bucket (harmful-refused, harmful-not-refused, benign).
-TARGET_COUNT = 200
+# Best-effort cap on how many prompts to draw from each source before running
+# the model. Tune these to trade dataset size against compute. They only bound
+# the pool; downstream labeling decides the final harmful/refused composition.
+HARMFUL_COUNT = 400
+BENIGN_COUNT = 200
 
 
-def classify_refusal(response: str, extractor: ActivationExtractor) -> bool:
-    """Classify a model response as a refusal.
-
-    Delegates to the extractor's phrase-based detector, which owns the full
-    refusal phrase list. Empty or whitespace-only responses contain none of the
-    phrases and therefore classify as not-refused.
-
-    Always returns a native Python ``bool``.
-    """
-    return bool(extractor.label_refusal(response))
-
-
-def make_row(prompt, response, harmful, refused):
-    """Build the internal row dict for a single prompt/response record.
-
-    The ``harmful`` and ``refused`` flags are coerced to ints (0/1) so the row
-    is JSON-integer compatible with the downstream ProbeDataset reader.
-    """
-    return {
-        "prompt": prompt,
-        "response": response,
-        "harmful": int(harmful),
-        "refused": int(refused),
-    }
-
-
-def cap_bucket(name, rows, target=TARGET_COUNT):
+def cap_bucket(name, rows, target):
     """Cap a bucket to ``target`` records on a best-effort basis.
 
     Returns the first ``target`` rows when the bucket has at least ``target``
@@ -67,7 +51,7 @@ def cap_bucket(name, rows, target=TARGET_COUNT):
     if len(rows) >= target:
         return rows[:target]
     print(f"WARNING: bucket '{name}' has {len(rows)}/{target} records; "
-          f"writing all {len(rows)} available.")
+          f"using all {len(rows)} available.")
     return rows
 
 
@@ -76,97 +60,91 @@ def build_harmful_pool():
 
     Loads records from ``HarmBenchDataset`` and ``AdvBenchDataset`` (each
     ``get_records()`` returns a ``list[PromptRecord]``) and concatenates them
-    into a single list. Every record in both sources already carries
-    ``category="harmful"``; the ``harmful=1`` flag is applied later during row
-    construction, so this function simply returns the combined list.
+    into a single list.
     """
     hb = HarmBenchDataset().get_records()
     ab = AdvBenchDataset().get_records()
     return hb + ab
 
 
-def process_harmful(pool, llm, extractor, target):
-    """Generate + classify responses for the harmful prompt pool.
+def build_benign_pool():
+    """Return the benign prompt records from ``CustomPromptDataset``.
 
-    Iterates ``pool`` (a list of ``PromptRecord``), calling ``llm.generate`` once
-    per prompt and routing each response via ``classify_refusal`` into one of two
-    harmful buckets: the refused bucket (``harmful=1, refused=1``) or the
-    not-refused bucket (``harmful=1, refused=0``). Every harmful record therefore
-    lands in exactly one bucket, decided solely by the classifier.
-
-    The loop early-stops once BOTH buckets have reached ``target`` records to
-    avoid unnecessary model calls. Progress is reported via ``tqdm``.
-
-    Returns ``(refused, not_refused)`` lists of row dicts built by ``make_row``.
+    Selects every record whose ``category`` is not ``"harmful"``.
     """
-    refused, not_refused = [], []
-    for rec in tqdm(pool, desc="Harmful prompts"):
-        if len(refused) >= target and len(not_refused) >= target:
-            break                       # early stop once both buckets full
-        response = llm.generate(rec.prompt)
-        if classify_refusal(response, extractor):
-            refused.append(make_row(rec.prompt, response, harmful=1, refused=1))
-        else:
-            not_refused.append(make_row(rec.prompt, response, harmful=1, refused=0))
-    return refused, not_refused
+    return [r for r in CustomPromptDataset().get_records()
+            if r.category != "harmful"]
 
 
-def process_benign(llm, extractor, target):
-    """Generate + classify responses for the benign prompt set.
+def build_prompt_pool(harmful_count=HARMFUL_COUNT, benign_count=BENIGN_COUNT):
+    """Assemble the capped prompt pool from the harmful and benign sources.
 
-    Selects every non-harmful record from ``CustomPromptDataset`` (those whose
-    ``category != "harmful"``), then calls ``llm.generate`` once per prompt up to
-    ``target`` records. The loop early-stops at the top once ``target`` rows have
-    been collected to avoid unnecessary model calls. Each response is classified
-    via ``classify_refusal`` and stored with ``harmful=0``. Progress is reported
-    via ``tqdm``.
+    Each source is capped independently (best-effort) via ``cap_bucket`` and the
+    two capped lists are concatenated (harmful first, then benign). The prompt
+    text is all that flows downstream; source membership is not recorded, since
+    labeling is deferred to a separate script.
 
-    Returns a list of row dicts built by ``make_row``.
+    Returns a ``list[PromptRecord]``.
     """
-    benign = [r for r in CustomPromptDataset().get_records()
-              if r.category != "harmful"]
-    rows = []
-    for rec in tqdm(benign, desc="Benign prompts"):
-        if len(rows) >= target:
-            break                       # early stop once target reached
-        response = llm.generate(rec.prompt)
-        rows.append(make_row(rec.prompt, response, harmful=0,
-                             refused=int(classify_refusal(response, extractor))))
-    return rows
+    harmful = cap_bucket("harmful", build_harmful_pool(), harmful_count)
+    benign = cap_bucket("benign", build_benign_pool(), benign_count)
+    return harmful + benign
 
 
-def assign_ids(harmful_refused, harmful_not_refused, benign):
-    """Concatenate the three capped buckets and stamp fresh sequential ids.
+def assign_ids(pool):
+    """Stamp fresh sequential ids onto the prompt pool.
 
-    Buckets are concatenated in order (harmful-refused, harmful-not-refused,
-    benign). Each output record is assigned a fresh sequential integer ``id``
-    starting at 0, and its ``harmful``/``refused`` flags are cast to ints (0/1)
-    for JSON-integer compatibility with the downstream ProbeDataset reader.
+    Iterates ``pool`` (a list of ``PromptRecord``) and returns a list of dicts
+    with keys exactly ``id`` (a fresh sequential integer starting at 0) and
+    ``prompt``. Response text is attached later, after generation.
 
-    Returns a list of dicts with keys exactly ``id, prompt, response, harmful,
-    refused``.
+    Returns a list of ``{id, prompt}`` dicts.
     """
-    all_rows = harmful_refused + harmful_not_refused + benign
+    return [{"id": i, "prompt": rec.prompt} for i, rec in enumerate(pool)]
+
+
+def generate_responses(records, llm):
+    """Generate a model response for each record's prompt.
+
+    Iterates the id-stamped ``records`` list, calling ``llm.generate`` once per
+    prompt, and returns a new list of ``{id, prompt, response}`` dicts (the
+    final metadata schema). Progress is reported via ``tqdm``.
+    """
     return [
-        {
-            "id": i,                                # fresh sequential unique id
-            "prompt": row["prompt"],
-            "response": row["response"],
-            "harmful": int(row["harmful"]),         # int 0/1
-            "refused": int(row["refused"]),         # int 0/1
-        }
-        for i, row in enumerate(all_rows)
+        {"id": row["id"], "prompt": row["prompt"],
+         "response": llm.generate(row["prompt"])}
+        for row in tqdm(records, desc="Generating responses")
     ]
+
+
+def extract_activations(records, llm, layers=LAYERS):
+    """Extract hidden-state activations for each record's prompt.
+
+    Iterates the final, id-stamped ``records`` list and calls
+    ``llm.get_activations(prompt, layers)`` once per record. Each record's
+    activation mapping is keyed by the record's ``id`` so the result aligns with
+    the metadata by id.
+
+    ``LLMInterface.get_activations`` returns a ``{layer: tensor}`` mapping with
+    each tensor already detached and moved to CPU, so no further device handling
+    is needed here.
+
+    Returns ``{id: {layer: cpu_tensor}}``.
+    """
+    activations = {}
+    for row in tqdm(records, desc="Extracting activations"):
+        activations[row["id"]] = llm.get_activations(row["prompt"], layers)
+    return activations
 
 
 def write_metadata(slug, records):
     """Serialize an already-id-stamped records list to a per-model JSON file.
 
-    Serializes ``records`` (a list of dicts already stamped with ids by
-    ``assign_ids``) to ``data/processed/{slug}/metadata.json`` with ``indent=2``
-    (human-readable) and ``ensure_ascii=False`` (legible prompts/responses);
-    JSON string escaping handles commas, quotes, and newlines in
-    prompts/responses automatically. Creates the output directory if missing.
+    Serializes ``records`` (a list of ``{id, prompt, response}`` dicts) to
+    ``data/processed/{slug}/metadata.json`` with ``indent=2`` (human-readable)
+    and ``ensure_ascii=False`` (legible prompts/responses); JSON string escaping
+    handles commas, quotes, and newlines automatically. Creates the output
+    directory if missing.
 
     Returns the list of record dicts that was written.
     """
@@ -191,60 +169,25 @@ def write_activations(slug, activations):
     torch.save(activations, out_dir / "activations.pt")
 
 
-def extract_activations(records, llm, layers=LAYERS):
-    """Extract hidden-state activations for each kept record's prompt.
-
-    Iterates the final, capped, id-stamped ``records`` list (so only records
-    actually written to the Metadata_File incur a forward pass) and calls
-    ``llm.get_activations(prompt, layers)`` once per record. Each record's
-    activation mapping is keyed by the record's ``id`` so the result aligns with
-    the metadata by id.
-
-    ``LLMInterface.get_activations`` returns a ``{layer: tensor}`` mapping with
-    each tensor already detached and moved to CPU, so no further device handling
-    is needed here.
-
-    Returns ``{id: {layer: cpu_tensor}}``.
-    """
-    activations = {}
-    for row in tqdm(records, desc="Extracting activations"):
-        activations[row["id"]] = llm.get_activations(row["prompt"], layers)
-    return activations
-
-
 def main():
     """Entry point for the data-preparation pipeline.
 
-    Wires the full pipeline: derive the per-model slug, load the LLM and
-    activation extractor, assemble the harmful prompt pool, generate + classify
-    responses for the harmful and benign sets, cap each of the three buckets to
-    TARGET_COUNT, and write the per-model ``metadata.json``.
+    Wires the full pipeline: derive the per-model slug, load the LLM, assemble
+    the capped prompt pool, stamp ids, generate responses, extract activations,
+    and write the id-aligned ``metadata.json`` and ``activations.pt``. No
+    labeling is performed here.
     """
     slug = model_slug(MODEL_NAME)
 
     llm = LLMInterface()
-    extractor = ActivationExtractor(llm)
 
-    pool = build_harmful_pool()
-    harmful_refused, harmful_not_refused = process_harmful(
-        pool, llm, extractor, TARGET_COUNT
-    )
-    benign = process_benign(llm, extractor, TARGET_COUNT)
+    pool = build_prompt_pool(HARMFUL_COUNT, BENIGN_COUNT)
+    records = assign_ids(pool)
 
-    harmful_refused = cap_bucket("harmful_refused", harmful_refused, TARGET_COUNT)
-    harmful_not_refused = cap_bucket(
-        "harmful_not_refused", harmful_not_refused, TARGET_COUNT
-    )
-    benign = cap_bucket("benign", benign, TARGET_COUNT)
+    print(f"Pool size: {len(pool)} | "
+          f"harmful cap: {HARMFUL_COUNT} | benign cap: {BENIGN_COUNT}")
 
-    print(
-        f"Pool size: {len(pool)} | "
-        f"harmful_refused: {len(harmful_refused)} | "
-        f"harmful_not_refused: {len(harmful_not_refused)} | "
-        f"benign: {len(benign)} | target: {TARGET_COUNT}"
-    )
-
-    records = assign_ids(harmful_refused, harmful_not_refused, benign)
+    records = generate_responses(records, llm)
     write_metadata(slug, records)
     print(f"Wrote dataset to data/processed/{slug}/metadata.json")
 
