@@ -1,3 +1,5 @@
+import os
+
 from transformers import AutoTokenizer
 from transformers import AutoModelForCausalLM
 
@@ -15,16 +17,44 @@ class LLMInterface:
             MODEL_NAME
         )
 
-        device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        if torch.backends.mps.is_available():
+            device = 'mps'
+        elif torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            dtype=dtype,
+        # Use half precision on accelerators (mps/cuda) to roughly halve the
+        # memory footprint and speed up inference; fall back to float32 on CPU
+        # where float16 is slow/unsupported for many ops. float16 (not bf16) is
+        # chosen so the same path works on V100 GPUs, which lack bf16 support.
+        dtype = torch.float32 if device == 'cpu' else torch.float16
+
+        # For models too large to fit on a single GPU (e.g. Qwen2.5-32B, ~64GB
+        # in fp16), set DL_DEVICE_MAP=auto so accelerate shards the weights
+        # across all visible GPUs. This path is CUDA-only; local MPS/CPU runs
+        # keep the original single-device .to(device) behavior untouched.
+        use_device_map = (
+            device == 'cuda'
+            and os.environ.get("DL_DEVICE_MAP", "").lower() in ("1", "auto", "true")
         )
 
-        self.model.to(device)
-        self.device = device
+        if use_device_map:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                dtype=dtype,
+                device_map="auto",
+            )
+            # accelerate places the input embeddings here; sending inputs to
+            # this device is correct for a sharded model.
+            self.device = self.model.device
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                dtype=dtype,
+            )
+            self.model.to(device)
+            self.device = device
 
 
     def generate(self, prompt):
@@ -36,8 +66,14 @@ class LLMInterface:
             max_new_tokens=MAX_NEW_TOKENS
         )
 
+        # outputs[0] contains the full sequence: the templated prompt tokens
+        # (system + user) followed by the newly generated answer tokens. Slice
+        # off the prompt tokens so we decode only the model's answer.
+        prompt_len = inputs["input_ids"].shape[-1]
+        generated = outputs[0][prompt_len:]
+
         return self.tokenizer.decode(
-            outputs[0],
+            generated,
             skip_special_tokens=True
         )
     
