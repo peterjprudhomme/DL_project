@@ -37,8 +37,8 @@ from src.config import MODEL_NAME, LAYERS, model_slug
 # Best-effort cap on how many prompts to draw from each source before running
 # the model. Tune these to trade dataset size against compute. They only bound
 # the pool; downstream labeling decides the final harmful/refused composition.
-HARMFUL_COUNT = 400
-BENIGN_COUNT = 200
+HARMFUL_COUNT = 10
+BENIGN_COUNT = 10
 
 
 def cap_bucket(name, rows, target):
@@ -106,39 +106,29 @@ def assign_ids(pool):
             for i, rec in enumerate(pool)]
 
 
-def generate_responses(records, llm):
-    """Generate a model response for each record's prompt.
+def generate_responses_and_activations(records, llm, layers=LAYERS):
+    """Generate responses and extract activations in a single model pass.
 
-    Iterates the id-stamped ``records`` list, calling ``llm.generate`` once per
-    prompt, and returns a new list of ``{id, prompt, response, harmful}`` dicts
-    (the final metadata schema, with ``harmful`` last). The ``harmful`` label is
-    carried through unchanged. Progress is reported via ``tqdm``.
+    Iterates the id-stamped ``records`` list and calls
+    ``llm.generate_with_activations(prompt, layers)`` once per prompt, so the
+    response text and the prompt's hidden-state activations come from the SAME
+    forward pass (instead of running the model twice).
+
+    Returns ``(metadata, activations)`` where ``metadata`` is a list of
+    ``{id, prompt, response, harmful}`` dicts (the final schema, with ``harmful``
+    last) and ``activations`` is a ``{id: {layer: cpu_tensor}}`` mapping keyed by
+    id so the two artifacts stay id-aligned. Progress is reported via ``tqdm``.
     """
-    return [
-        {"id": row["id"], "prompt": row["prompt"],
-         "response": llm.generate(row["prompt"]), "harmful": row["harmful"]}
-        for row in tqdm(records, desc="Generating responses")
-    ]
-
-
-def extract_activations(records, llm, layers=LAYERS):
-    """Extract hidden-state activations for each record's prompt.
-
-    Iterates the final, id-stamped ``records`` list and calls
-    ``llm.get_activations(prompt, layers)`` once per record. Each record's
-    activation mapping is keyed by the record's ``id`` so the result aligns with
-    the metadata by id.
-
-    ``LLMInterface.get_activations`` returns a ``{layer: tensor}`` mapping with
-    each tensor already detached and moved to CPU, so no further device handling
-    is needed here.
-
-    Returns ``{id: {layer: cpu_tensor}}``.
-    """
+    metadata = []
     activations = {}
-    for row in tqdm(records, desc="Extracting activations"):
-        activations[row["id"]] = llm.get_activations(row["prompt"], layers)
-    return activations
+    for row in tqdm(records, desc="Generating responses + activations"):
+        response, acts = llm.generate_with_activations(row["prompt"], layers)
+        metadata.append({
+            "id": row["id"], "prompt": row["prompt"],
+            "response": response, "harmful": row["harmful"],
+        })
+        activations[row["id"]] = acts
+    return metadata, activations
 
 
 def write_metadata(slug, records):
@@ -191,11 +181,10 @@ def main():
     print(f"Pool size: {len(pool)} | "
           f"harmful cap: {HARMFUL_COUNT} | benign cap: {BENIGN_COUNT}")
 
-    records = generate_responses(records, llm)
+    records, activations = generate_responses_and_activations(records, llm, LAYERS)
     write_metadata(slug, records)
     print(f"Wrote dataset to data/processed/{slug}/metadata.json")
 
-    activations = extract_activations(records, llm, LAYERS)
     write_activations(slug, activations)
     print(f"Wrote activations to data/processed/{slug}/activations.pt")
 

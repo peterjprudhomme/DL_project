@@ -77,6 +77,53 @@ class LLMInterface:
             skip_special_tokens=True
         )
     
+    def generate_with_activations(self, prompt, layers, token_position=-1):
+        """Generate a response and extract prompt activations in one pass.
+
+        Runs ``model.generate`` a single time with ``output_hidden_states`` so
+        the response text and the prompt's hidden states come from the same
+        forward pass, avoiding the separate prefill that ``get_activations``
+        would otherwise do.
+
+        The hidden states from the first generation step cover the full prompt
+        (shape ``[batch, prompt_len, hidden]`` per layer), so indexing
+        ``token_position`` there yields the exact same vectors as
+        ``get_activations(prompt, layers, token_position)``.
+
+        Returns ``(response_str, {layer: cpu_tensor})``.
+        """
+        inputs = self._prepare_inputs(prompt)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
+
+        # sequences[0] is the full sequence (prompt tokens + generated tokens);
+        # slice off the prompt to decode only the model's answer.
+        prompt_len = inputs["input_ids"].shape[-1]
+        generated = outputs.sequences[0][prompt_len:]
+        response = self.tokenizer.decode(generated, skip_special_tokens=True)
+
+        # hidden_states[0] is the prefill step: a tuple over layers, each tensor
+        # shaped [batch, prompt_len, hidden]. Later steps hold one token each.
+        prefill_hidden_states = outputs.hidden_states[0]
+
+        activations = {}
+        for layer in layers:
+            if layer < 0 or layer >= len(prefill_hidden_states):
+                raise ValueError(
+                    f"Layer {layer} does not exist. "
+                    f"Model has {len(prefill_hidden_states)} hidden-state tensors."
+                )
+            activation = prefill_hidden_states[layer][0, token_position, :]
+            activations[layer] = activation.detach().cpu()
+
+        return response, activations
+
     def tokenize(self, prompt):
 
         messages = [
