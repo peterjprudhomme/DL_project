@@ -7,14 +7,14 @@ configured LLM, and extracts hidden-state activations for each prompt. The
 result is written to a per-model directory under ``data/processed/{model_slug}/``
 as two id-aligned artifacts:
 
-    metadata.json   -> a JSON list of {id, prompt, response} objects
+    metadata.json   -> a JSON list of {id, prompt, response, harmful} objects
     activations.pt  -> a {id: {layer: cpu_tensor}} mapping
 
-This script deliberately does NOT label responses. The ``harmful`` and
-``refused`` flags are assigned by a separate downstream labeling script that
-reads ``metadata.json`` and adds those columns. Decoupling generation (an
-expensive GPU pass) from labeling lets the refusal/harmfulness classifier be
-iterated on without re-running the model.
+The ``harmful`` flag is the prompt's design-time ``expected_harmful`` label,
+encoded as ``1`` (harmful) or ``0`` (not harmful / ambiguous), carried straight
+through from the source dataset. The ``refused`` flag is a property of the
+model's response and is still assigned by a separate downstream labeling script
+that reads ``metadata.json``.
 
 Usage:
     python -m data.prepare_dataset        # from the DL_project root
@@ -95,24 +95,28 @@ def assign_ids(pool):
     """Stamp fresh sequential ids onto the prompt pool.
 
     Iterates ``pool`` (a list of ``PromptRecord``) and returns a list of dicts
-    with keys exactly ``id`` (a fresh sequential integer starting at 0) and
-    ``prompt``. Response text is attached later, after generation.
+    with keys ``id`` (a fresh sequential integer starting at 0), ``prompt``, and
+    ``harmful`` (the record's design-time ``expected_harmful`` flag encoded as
+    ``1`` or ``0``). Response text is attached later, after generation.
 
-    Returns a list of ``{id, prompt}`` dicts.
+    Returns a list of ``{id, prompt, harmful}`` dicts.
     """
-    return [{"id": i, "prompt": rec.prompt} for i, rec in enumerate(pool)]
+    return [{"id": i, "prompt": rec.prompt,
+             "harmful": int(bool(rec.expected_harmful))}
+            for i, rec in enumerate(pool)]
 
 
 def generate_responses(records, llm):
     """Generate a model response for each record's prompt.
 
     Iterates the id-stamped ``records`` list, calling ``llm.generate`` once per
-    prompt, and returns a new list of ``{id, prompt, response}`` dicts (the
-    final metadata schema). Progress is reported via ``tqdm``.
+    prompt, and returns a new list of ``{id, prompt, response, harmful}`` dicts
+    (the final metadata schema, with ``harmful`` last). The ``harmful`` label is
+    carried through unchanged. Progress is reported via ``tqdm``.
     """
     return [
         {"id": row["id"], "prompt": row["prompt"],
-         "response": llm.generate(row["prompt"])}
+         "response": llm.generate(row["prompt"]), "harmful": row["harmful"]}
         for row in tqdm(records, desc="Generating responses")
     ]
 
@@ -140,7 +144,7 @@ def extract_activations(records, llm, layers=LAYERS):
 def write_metadata(slug, records):
     """Serialize an already-id-stamped records list to a per-model JSON file.
 
-    Serializes ``records`` (a list of ``{id, prompt, response}`` dicts) to
+    Serializes ``records`` (a list of ``{id, prompt, response, harmful}`` dicts) to
     ``data/processed/{slug}/metadata.json`` with ``indent=2`` (human-readable)
     and ``ensure_ascii=False`` (legible prompts/responses); JSON string escaping
     handles commas, quotes, and newlines automatically. Creates the output
