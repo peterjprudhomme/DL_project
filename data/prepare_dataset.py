@@ -29,7 +29,12 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from data.dataset import HarmBenchDataset, AdvBenchDataset, CustomPromptDataset
+from data.dataset import (
+    HarmBenchDataset,
+    AdvBenchDataset,
+    CustomPromptDataset,
+    JailbreakPromptDataset,
+)
 from src.llm import LLMInterface
 from src.config import MODEL_NAME, LAYERS, model_slug
 
@@ -37,8 +42,18 @@ from src.config import MODEL_NAME, LAYERS, model_slug
 # Best-effort cap on how many prompts to draw from each source before running
 # the model. Tune these to trade dataset size against compute. They only bound
 # the pool; downstream labeling decides the final harmful/refused composition.
-HARMFUL_COUNT = 10
-BENIGN_COUNT = 10
+HARMFUL_COUNT = 400
+BENIGN_COUNT = 200
+
+# Jailbreak augmentation (opt-in). When INCLUDE_JAILBREAK is True, the
+# jailbreak-wrapped harmful prompts from data/jailbreak_prompts.json are appended
+# to the base pool. These supply the harmful+complied (HC) samples the plain pool
+# is short on. The file is loaded via JailbreakPromptDataset, exactly like the
+# benign set is loaded via CustomPromptDataset -- no code dependency on the
+# generator (data/make_jailbreak_prompts.py), which is a one-time authoring tool.
+# Set INCLUDE_JAILBREAK = False for the original 3-bucket behavior.
+INCLUDE_JAILBREAK = True
+JAILBREAK_COUNT = 400
 
 
 def cap_bucket(name, rows, target):
@@ -91,18 +106,40 @@ def build_prompt_pool(harmful_count=HARMFUL_COUNT, benign_count=BENIGN_COUNT):
     return harmful + benign
 
 
+# --- Jailbreak augmentation helper (mirrors the CustomPromptDataset pattern;
+#     does not alter the base 3-bucket pool above) ---------------------------
+
+def build_jailbreak_pool(jailbreak_count=JAILBREAK_COUNT):
+    """Return capped jailbreak-wrapped harmful records (harmful+jailbreak bucket).
+
+    Loads ``jailbreak_prompts.json`` via ``JailbreakPromptDataset`` -- the same
+    static-file + dataset-class pattern used for the benign set. Returns an empty
+    list with a warning if the file is missing, so a run can still proceed.
+    """
+    try:
+        rows = JailbreakPromptDataset().get_records()
+    except FileNotFoundError:
+        print("WARNING: jailbreak_prompts.json not found; skipping jailbreak "
+              "bucket. Run `python -m data.make_jailbreak_prompts` first.")
+        return []
+    return cap_bucket("harmful_jailbreak", rows, jailbreak_count)
+
+
 def assign_ids(pool):
     """Stamp fresh sequential ids onto the prompt pool.
 
     Iterates ``pool`` (a list of ``PromptRecord``) and returns a list of dicts
     with keys ``id`` (a fresh sequential integer starting at 0), ``prompt``, and
-    ``harmful`` (the record's design-time ``expected_harmful`` flag encoded as
-    ``1`` or ``0``). Response text is attached later, after generation.
+    ``harmful`` (the record's design-time ``expected_harmful`` label encoded as
+    ``1`` or ``0``). The ``group`` and ``template`` provenance fields are carried
+    through as-is (``None`` for the plain harmful/benign records). Response text
+    is attached later, after generation.
 
-    Returns a list of ``{id, prompt, harmful}`` dicts.
+    Returns a list of ``{id, prompt, harmful, group, template}`` dicts.
     """
     return [{"id": i, "prompt": rec.prompt,
-             "harmful": int(bool(rec.expected_harmful))}
+             "harmful": int(bool(rec.expected_harmful)),
+             "group": rec.group, "template": rec.template}
             for i, rec in enumerate(pool)]
 
 
@@ -115,9 +152,9 @@ def generate_responses_and_activations(records, llm, layers=LAYERS):
     forward pass (instead of running the model twice).
 
     Returns ``(metadata, activations)`` where ``metadata`` is a list of
-    ``{id, prompt, response, harmful}`` dicts (the final schema, with ``harmful``
-    last) and ``activations`` is a ``{id: {layer: cpu_tensor}}`` mapping keyed by
-    id so the two artifacts stay id-aligned. Progress is reported via ``tqdm``.
+    ``{id, prompt, response, harmful, group, template}`` dicts and
+    ``activations`` is a ``{id: {layer: cpu_tensor}}`` mapping keyed by id so the
+    two artifacts stay id-aligned. Progress is reported via ``tqdm``.
     """
     metadata = []
     activations = {}
@@ -126,6 +163,7 @@ def generate_responses_and_activations(records, llm, layers=LAYERS):
         metadata.append({
             "id": row["id"], "prompt": row["prompt"],
             "response": response, "harmful": row["harmful"],
+            "group": row.get("group"), "template": row.get("template"),
         })
         activations[row["id"]] = acts
     return metadata, activations
@@ -134,11 +172,10 @@ def generate_responses_and_activations(records, llm, layers=LAYERS):
 def write_metadata(slug, records):
     """Serialize an already-id-stamped records list to a per-model JSON file.
 
-    Serializes ``records`` (a list of ``{id, prompt, response, harmful}`` dicts) to
-    ``data/processed/{slug}/metadata.json`` with ``indent=2`` (human-readable)
-    and ``ensure_ascii=False`` (legible prompts/responses); JSON string escaping
-    handles commas, quotes, and newlines automatically. Creates the output
-    directory if missing.
+    Serializes ``records`` to ``data/processed/{slug}/metadata.json`` with
+    ``indent=2`` (human-readable) and ``ensure_ascii=False`` (legible
+    prompts/responses); JSON string escaping handles commas, quotes, and
+    newlines automatically. Creates the output directory if missing.
 
     Returns the list of record dicts that was written.
     """
@@ -167,19 +204,23 @@ def main():
     """Entry point for the data-preparation pipeline.
 
     Wires the full pipeline: derive the per-model slug, load the LLM, assemble
-    the capped prompt pool, stamp ids, generate responses, extract activations,
-    and write the id-aligned ``metadata.json`` and ``activations.pt``. No
-    labeling is performed here.
+    the capped prompt pool (optionally augmented with the jailbreak + benign
+    wrapper-control buckets), stamp ids, generate responses, extract
+    activations, and write the id-aligned ``metadata.json`` and
+    ``activations.pt``. No labeling is performed here.
     """
     slug = model_slug(MODEL_NAME)
 
     llm = LLMInterface()
 
     pool = build_prompt_pool(HARMFUL_COUNT, BENIGN_COUNT)
+    if INCLUDE_JAILBREAK:
+        pool = pool + build_jailbreak_pool(JAILBREAK_COUNT)
     records = assign_ids(pool)
 
     print(f"Pool size: {len(pool)} | "
-          f"harmful cap: {HARMFUL_COUNT} | benign cap: {BENIGN_COUNT}")
+          f"harmful cap: {HARMFUL_COUNT} | benign cap: {BENIGN_COUNT} | "
+          f"jailbreak: {INCLUDE_JAILBREAK}")
 
     records, activations = generate_responses_and_activations(records, llm, LAYERS)
     write_metadata(slug, records)
